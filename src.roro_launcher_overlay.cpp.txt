@@ -1,0 +1,216 @@
+// roro_launcher_overlay.cpp
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <shellapi.h>
+#include <shlwapi.h>
+#pragma comment(lib, "Shlwapi.lib")
+
+#include <glad/glad.h>
+#include <GLFW/glfw3.h>
+
+#include "imgui.h"
+#include "backends/imgui_impl_glfw.h"
+#include "backends/imgui_impl_opengl3.h"
+
+#include <stb_image.h>
+#include <nlohmann/json.hpp>
+
+#include <string>
+#include <fstream>
+#include <iostream>
+#include <chrono>
+#include <deque>
+#include <map>
+
+using json = nlohmann::json;
+using Clock = std::chrono::high_resolution_clock;
+
+struct PanelConfig {
+    bool enabled = true;
+    bool background = true;
+    float scale = 1.0f;
+    float color[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    float bgColor[4] = {0.0f,0.0f,0.0f,0.5f};
+    bool movable = true;
+    ImVec2 pos = ImVec2(100,100);
+};
+
+struct AppConfig {
+    std::string minecraftPath = "";
+    bool overlayClickThrough = false;
+    bool overlayAlwaysOnTop = true;
+    std::map<std::string, PanelConfig> panels;
+};
+
+static AppConfig g_config;
+static const char* CONFIG_FILE = "roro_config.json";
+static const char* PANEL_NAMES[] = {
+    "FPS COUNTER","CPS COUNTER","KEYSTROKE","REACH COUNTER","WATERMARK",
+    "MOOVABLE CHAT","MOOVABLE UI","MOOVABLE SCOREBOARD","FAST INVENTORY","JAVA INVENTORY",
+    "ESP","WHEATHER CHANGER","TIME CHANGER","FOV","NAMETAGS","HIDE_PSEUDO","TWERK","JAVA_MOVEMENTS"
+};
+
+void load_config(){
+    std::ifstream in(CONFIG_FILE);
+    if(!in) {
+        for(auto &name : PANEL_NAMES){
+            PanelConfig p; g_config.panels[name] = p;
+        }
+        return;
+    }
+    try{
+        json j; in >> j;
+        g_config.minecraftPath = j.value("minecraftPath", "");
+        g_config.overlayClickThrough = j.value("overlayClickThrough", false);
+        g_config.overlayAlwaysOnTop = j.value("overlayAlwaysOnTop", true);
+        if(j.contains("panels")){
+            for(auto &it : j["panels"].items()){
+                PanelConfig p;
+                auto obj = it.value();
+                p.enabled = obj.value("enabled", true);
+                p.background = obj.value("background", true);
+                p.scale = obj.value("scale", 1.0f);
+                if(obj.contains("color")){
+                    auto a = obj["color"];
+                    for(int i=0;i<4;i++) p.color[i] = a.value(i, p.color[i]);
+                }
+                if(obj.contains("bgColor")){
+                    auto a = obj["bgColor"];
+                    for(int i=0;i<4;i++) p.bgColor[i] = a.value(i, p.bgColor[i]);
+                }
+                if(obj.contains("pos")){
+                    auto a = obj["pos"];
+                    p.pos.x = a.value(0, p.pos.x); p.pos.y = a.value(1, p.pos.y);
+                }
+                p.movable = obj.value("movable", true);
+                g_config.panels[it.key()] = p;
+            }
+        }
+    } catch(...){ std::cerr<<"Failed to parse config.json\n"; }
+}
+
+void save_config(){
+    json j;
+    j["minecraftPath"] = g_config.minecraftPath;
+    j["overlayClickThrough"] = g_config.overlayClickThrough;
+    j["overlayAlwaysOnTop"] = g_config.overlayAlwaysOnTop;
+    json panels;
+    for(auto &kv : g_config.panels){
+        json p;
+        p["enabled"] = kv.second.enabled;
+        p["background"] = kv.second.background;
+        p["scale"] = kv.second.scale;
+        p["movable"] = kv.second.movable;
+        p["color"] = { kv.second.color[0], kv.second.color[1], kv.second.color[2], kv.second.color[3] };
+        p["bgColor"] = { kv.second.bgColor[0], kv.second.bgColor[1], kv.second.bgColor[2], kv.second.bgColor[3] };
+        p["pos"] = { kv.second.pos.x, kv.second.pos.y };
+        panels[kv.first] = p;
+    }
+    j["panels"] = panels;
+    std::ofstream out(CONFIG_FILE);
+    out << j.dump(4);
+}
+
+bool launch_minecraft(const std::string &path){
+    if(path.empty()) return false;
+    HINSTANCE h = ShellExecuteA(NULL, "open", path.c_str(), NULL, NULL, SW_SHOWNORMAL);
+    if((INT_PTR)h > 32) return true;
+    STARTUPINFOA si; PROCESS_INFORMATION pi; ZeroMemory(&si, sizeof(si)); si.cb = sizeof(si); ZeroMemory(&pi, sizeof(pi));
+    BOOL ok = CreateProcessA(path.c_str(), NULL, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi);
+    if(ok){ CloseHandle(pi.hProcess); CloseHandle(pi.hThread); return true; }
+    return false;
+}
+
+std::deque<Clock::time_point> clickTimes;
+int getCPS(){ auto now = Clock::now(); while(!clickTimes.empty() && std::chrono::duration_cast<std::chrono::milliseconds>(now - clickTimes.front()).count() > 1000) clickTimes.pop_front(); return (int)clickTimes.size(); }
+float g_fps = 0.0f;
+bool keyStateW=false, keyStateA=false, keyStateS=false, keyStateD=false, keyStateSpace=false;
+float lastReach = 0.0f;
+
+GLuint loadTextureFromFile(const char* filename, int &out_w, int &out_h){
+    int n; unsigned char* data = stbi_load(filename, &out_w, &out_h, &n, 4);
+    if(!data) return 0;
+    GLuint tex; glGenTextures(1, &tex); glBindTexture(GL_TEXTURE_2D, tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, out_w, out_h, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
+    stbi_image_free(data);
+    return tex;
+}
+
+void setWindowClickThrough(HWND hwnd, bool clickThrough){
+    LONG ex = GetWindowLong(hwnd, GWL_EXSTYLE);
+    if(clickThrough) ex |= WS_EX_TRANSPARENT | WS_EX_LAYERED;
+    else ex &= ~(WS_EX_TRANSPARENT);
+    SetWindowLong(hwnd, GWL_EXSTYLE, ex);
+}
+
+int main(int argc, char** argv){
+    load_config();
+    if(!glfwInit()) return -1;
+
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+    glfwWindowHint(GLFW_DECORATED, GLFW_FALSE);
+
+    GLFWwindow* launcher = glfwCreateWindow(600, 360, "Roro Client Launcher", NULL, NULL);
+    if(!launcher){ glfwTerminate(); return -1; }
+    glfwMakeContextCurrent(launcher);
+    glfwSwapInterval(1);
+    if(!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)){ std::cerr<<"Failed to initialize GLAD\n"; }
+
+    IMGUI_CHECKVERSION(); ImGui::CreateContext(); ImGuiIO& io = ImGui::GetIO(); (void)io;
+    ImGui::StyleColorsDark();
+    ImGui_ImplGlfw_InitForOpenGL(launcher, true);
+    ImGui_ImplOpenGL3_Init("#version 330");
+
+    int bg_w=0, bg_h=0; GLuint bgTex = 0;
+    const char* default_bg = "assets/minecraft_bg.jpg";
+    bgTex = loadTextureFromFile(default_bg, bg_w, bg_h);
+
+    while(!glfwWindowShouldClose(launcher)){
+        glfwPollEvents();
+        glfwMakeContextCurrent(launcher);
+        int lw, lh; glfwGetFramebufferSize(launcher, &lw, &lh);
+        glViewport(0,0,lw,lh);
+        glClearColor(0.07f,0.07f,0.08f,1.0f);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+        ImGui_ImplOpenGL3_NewFrame(); ImGui_ImplGlfw_NewFrame(); ImGui::NewFrame();
+        ImGui::SetNextWindowSize(ImVec2((float)lw, (float)lh));
+        ImGui::SetNextWindowPos(ImVec2(0,0));
+        ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove;
+        ImGui::Begin("Launcher", NULL, flags);
+
+        if(bgTex){
+            ImGui::GetWindowDrawList()->AddImage((void*)(intptr_t)bgTex, ImVec2(0,0), ImVec2((float)lw,(float)lh), ImVec2(0,0), ImVec2(1,1), IM_COL32(255,255,255,220));
+        }
+
+        ImGui::SetCursorPosY(20);
+        ImGui::SetCursorPosX((lw/2) - 80);
+        ImGui::TextColored(ImVec4(1,1,1,1), "Roro Client");
+
+        ImGui::SetCursorPosX((lw/2)-60);
+        ImGui::SetCursorPosY((lh/2)-20);
+        if(ImGui::Button("Launch", ImVec2(120,40))){
+            launch_minecraft(g_config.minecraftPath);
+        }
+
+        ImGui::SameLine(); ImGui::SetCursorPosX((lw/2)+70);
+        if(ImGui::Button("Settings")){}
+
+        ImGui::SetCursorPosX(10); ImGui::SetCursorPosY((float)lh - 30);
+        ImGui::Text("Version: 1.0.0");
+
+        ImGui::End();
+        ImGui::Render(); ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+        glfwSwapBuffers(launcher);
+    }
+
+    save_config();
+    ImGui_ImplOpenGL3_Shutdown(); ImGui_ImplGlfw_Shutdown(); ImGui::DestroyContext();
+    glfwDestroyWindow(launcher);
+    glfwTerminate();
+    return 0;
+}
